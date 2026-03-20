@@ -179,8 +179,41 @@
   .task.is-done .radio { border-color: var(--blue); background: radial-gradient(circle at center, var(--blue) 0 42%, transparent 43% 100%); }
   .calendar-item.is-muted { opacity: .4; }
   .calendar-item, .task, .mini-day, .navbtn, .today, .view, .event { user-select: none; }
+  .event {
+    cursor: grab;
+    touch-action: none;
+  }
+  .editable-active .event {
+    cursor: default;
+  }
+  .event.is-dragging {
+    cursor: grabbing;
+    z-index: 8;
+  }
   .event.is-selected {
     box-shadow: inset 0 0 0 1px rgba(0,0,0,.04), 0 0 0 3px rgba(26,115,232,.32);
+  }
+  .event-resize-handle {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 4px;
+    height: 12px;
+    border-radius: 8px;
+    cursor: ns-resize;
+    opacity: 0;
+    background: linear-gradient(to bottom, transparent 0 28%, rgba(255,255,255,.82) 28% 42%, transparent 42% 58%, rgba(255,255,255,.82) 58% 72%, transparent 72% 100%);
+    transition: opacity .14s ease;
+  }
+  .event:hover .event-resize-handle,
+  .event.is-selected .event-resize-handle {
+    opacity: .68;
+  }
+  .editable-active .event-resize-handle {
+    display: none;
+  }
+  .event.compact .event-resize-handle {
+    bottom: 1px;
   }
   .dhead.is-selected .dnum span {
     display: inline-grid;
@@ -275,39 +308,250 @@
     </div>
   </aside>
   <div class="editing-toolbar" aria-hidden="true">
-    <span class="toolbar-status">Edit mode: Ctrl/Cmd+Shift+E</span>
+    <span class="toolbar-status">Edit mode: Ctrl/Cmd+Shift+E · drag/resize meetings when edit mode is off</span>
     <button class="toolbar-btn" type="button" data-action="save">Save</button>
     <button class="toolbar-btn" type="button" data-action="reset">Reset</button>
   </div>
 <script>
 (() => {
-  const storageKey = 'fakecalendar-production-text-v1';
+  const storageKey = 'fakecalendar-production-state-v2';
+  const legacyTextKey = 'fakecalendar-production-text-v1';
   const body = document.body;
   const toolbar = document.querySelector('.editing-toolbar');
-  const editableNodes = Array.from(document.querySelectorAll('[data-editable]'));
+  const grid = document.querySelector('.grid');
+  const nowLine = document.querySelector('.now-line');
+  const editableNodes = Array.from(document.querySelectorAll('[data-editable]:not(.event-title):not(.event-time)'));
+  const timeLabels = Array.from(document.querySelectorAll('.time-label'));
+  const initialDayLefts = Array.from(new Set(Array.from(document.querySelectorAll('.event')).map((eventCard) => parseFloat(eventCard.style.left)).filter((value) => Number.isFinite(value)))).sort((a, b) => a - b);
+  const defaultEventWidth = Array.from(document.querySelectorAll('.event')).map((eventCard) => parseFloat(eventCard.style.width)).find((value) => Number.isFinite(value)) || 342.3;
+  const firstHourTop = parseFloat(document.querySelector('.hline')?.style.top || '0');
+  const secondHourTop = parseFloat(document.querySelectorAll('.hline')[1]?.style.top || '123.5');
+  const hourHeight = secondHourTop - firstHourTop || 123.5;
+  const snapMinutes = 15;
+  const snapHeight = hourHeight / 4;
+  const startHour = parseInt((timeLabels[0]?.textContent || '7 AM').trim(), 10) || 7;
+  const gridHeight = grid.clientHeight;
+  const minDurationMinutes = 15;
+  const dynamicClasses = ['compact', 'long', 'is-selected', 'is-dragging'];
+  let eventStates = [];
+  let selectedEventId = null;
+  let interaction = null;
+
   editableNodes.forEach((node, index) => {
-    node.dataset.editId = String(index);
+    node.dataset.editId = `text-${index}`;
     node.setAttribute('spellcheck', 'false');
   });
 
-  function saveState() {
-    const state = editableNodes.map((node) => node.innerHTML);
-    localStorage.setItem(storageKey, JSON.stringify(state));
+  function snap(value, step) {
+    return Math.round(value / step) * step;
   }
 
-  function loadState() {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return;
-    try {
-      const state = JSON.parse(raw);
-      state.forEach((value, index) => {
-        if (editableNodes[index] && typeof value === 'string') {
-          editableNodes[index].innerHTML = value;
-        }
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function minutesToTop(minutes) {
+    return ((minutes - startHour * 60) / 60) * hourHeight;
+  }
+
+  function topToMinutes(top) {
+    return startHour * 60 + Math.round(top / snapHeight) * snapMinutes;
+  }
+
+  function durationToHeight(durationMinutes) {
+    return (durationMinutes / 60) * hourHeight;
+  }
+
+  function heightToDuration(height) {
+    return Math.max(minDurationMinutes, Math.round(height / snapHeight) * snapMinutes);
+  }
+
+  function parseClockPart(value, fallbackMeridiem = '') {
+    const match = value.trim().toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+    if (!match) return null;
+    const hours = Number(match[1]);
+    const minutes = Number(match[2] || '0');
+    const meridiem = match[3] || fallbackMeridiem;
+    if (!meridiem) return { hours, minutes, meridiem: '' };
+    const normalizedHours = hours % 12 + (meridiem === 'pm' ? 12 : 0);
+    return { hours: normalizedHours, minutes, meridiem };
+  }
+
+  function parseTimeRange(label) {
+    const normalized = label.replace(/–/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+    const parts = normalized.split('-').map((part) => part.trim());
+    if (parts.length !== 2) return null;
+    const secondRaw = parseClockPart(parts[1]);
+    if (!secondRaw) return null;
+    const firstRaw = parseClockPart(parts[0], secondRaw.meridiem);
+    if (!firstRaw) return null;
+    let start = firstRaw.hours * 60 + firstRaw.minutes;
+    let end = secondRaw.hours * 60 + secondRaw.minutes;
+    if (end <= start) end += 12 * 60;
+    return { start, end };
+  }
+
+  function formatSingleTime(totalMinutes, includeMeridiem) {
+    const minutes = ((totalMinutes % (24 * 60)) + (24 * 60)) % (24 * 60);
+    const rawHours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    const meridiem = rawHours >= 12 ? 'pm' : 'am';
+    const twelveHour = rawHours % 12 || 12;
+    const minuteText = mins ? `:${String(mins).padStart(2, '0')}` : '';
+    return `${twelveHour}${minuteText}${includeMeridiem ? meridiem : ''}`;
+  }
+
+  function formatTimeRange(startMinutes, endMinutes) {
+    const startMeridiem = startMinutes >= 12 * 60 ? 'pm' : 'am';
+    const endMeridiem = endMinutes >= 12 * 60 ? 'pm' : 'am';
+    const showStartMeridiem = startMeridiem !== endMeridiem;
+    return `${formatSingleTime(startMinutes, showStartMeridiem)} - ${formatSingleTime(endMinutes, true)}`;
+  }
+
+  function nearestDayLeft(left) {
+    return initialDayLefts.reduce((closest, current) => Math.abs(current - left) < Math.abs(closest - left) ? current : closest, initialDayLefts[0] || left);
+  }
+
+  function normalizeBaseClasses(className, titleText, height) {
+    const classes = className.split(/\s+/).filter(Boolean).filter((name) => !dynamicClasses.includes(name));
+    const withoutSizing = classes.filter((name) => name !== 'compact' && name !== 'long');
+    if (height <= snapHeight * 2) withoutSizing.push('compact');
+    if (titleText.trim().length >= 24 || height <= snapHeight * 4) withoutSizing.push('long');
+    return Array.from(new Set(withoutSizing)).join(' ');
+  }
+
+  function getEventTiming(state) {
+    const start = topToMinutes(state.top);
+    const duration = heightToDuration(state.height);
+    return { start, end: start + duration };
+  }
+
+  function makeEventState(state) {
+    const normalizedTop = clamp(snap(state.top, snapHeight), 0, gridHeight - snapHeight);
+    const normalizedHeight = clamp(snap(state.height, snapHeight), snapHeight, gridHeight - normalizedTop);
+    const titleText = state.titleHTML.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const normalized = {
+      id: state.id,
+      titleHTML: state.titleHTML,
+      left: nearestDayLeft(state.left),
+      top: normalizedTop,
+      width: state.width || defaultEventWidth,
+      height: normalizedHeight,
+      className: normalizeBaseClasses(state.className || 'event', titleText || 'Meeting', normalizedHeight),
+    };
+    const timing = getEventTiming(normalized);
+    normalized.start = timing.start;
+    normalized.end = timing.end;
+    return normalized;
+  }
+
+  function collectInitialEventStates() {
+    return Array.from(document.querySelectorAll('.event')).map((eventCard, index) => {
+      const timeLabel = eventCard.querySelector('.event-time')?.textContent || '';
+      const parsedRange = parseTimeRange(timeLabel);
+      const start = parsedRange?.start ?? topToMinutes(parseFloat(eventCard.style.top) || 0);
+      const end = parsedRange?.end ?? start + heightToDuration(parseFloat(eventCard.style.height) || snapHeight);
+      return makeEventState({
+        id: `event-${index + 1}`,
+        titleHTML: eventCard.querySelector('.event-title')?.innerHTML || 'Meeting',
+        className: Array.from(eventCard.classList).join(' '),
+        left: parseFloat(eventCard.style.left) || initialDayLefts[0] || 110,
+        top: minutesToTop(start),
+        width: parseFloat(eventCard.style.width) || defaultEventWidth,
+        height: durationToHeight(end - start),
       });
+    });
+  }
+
+  function getPersistedState() {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
     } catch (error) {
-      console.warn('Unable to load saved calendar text.', error);
+      console.warn('Unable to load saved calendar state.', error);
+      return null;
     }
+  }
+
+  function applyEditableState(savedEditable = []) {
+    const byId = new Map(savedEditable.map((entry) => [entry.id, entry.html]));
+    editableNodes.forEach((node) => {
+      if (byId.has(node.dataset.editId)) {
+        node.innerHTML = byId.get(node.dataset.editId);
+      }
+    });
+  }
+
+  function buildEventElement(state) {
+    const eventCard = document.createElement('div');
+    eventCard.dataset.eventId = state.id;
+    eventCard.innerHTML = `<div class="event-title">${state.titleHTML}</div><div class="event-time"></div><div class="event-resize-handle" aria-hidden="true"></div>`;
+    const title = eventCard.querySelector('.event-title');
+    title.setAttribute('spellcheck', 'false');
+    title.addEventListener('blur', () => {
+      const match = eventStates.find((entry) => entry.id === state.id);
+      if (!match) return;
+      match.titleHTML = title.innerHTML;
+      match.className = normalizeBaseClasses(match.className, title.textContent || '', match.height);
+      renderEvents();
+      saveState();
+      setEditMode(true);
+    });
+    title.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        title.blur();
+      }
+    });
+    eventCard.addEventListener('pointerdown', (event) => startEventInteraction(event, state.id));
+    eventCard.addEventListener('click', () => {
+      if (body.classList.contains('editable-active')) return;
+      selectEvent(state.id);
+    });
+    return eventCard;
+  }
+
+  function applyEventLayout(eventCard, state) {
+    const normalized = makeEventState(state);
+    Object.assign(state, normalized);
+    eventCard.className = state.className;
+    if (state.id === selectedEventId) eventCard.classList.add('is-selected');
+    eventCard.style.left = `${state.left.toFixed(1)}px`;
+    eventCard.style.top = `${state.top.toFixed(1)}px`;
+    eventCard.style.width = `${state.width.toFixed(1)}px`;
+    eventCard.style.height = `${state.height.toFixed(1)}px`;
+    eventCard.querySelector('.event-title').innerHTML = state.titleHTML;
+    eventCard.querySelector('.event-time').textContent = formatTimeRange(state.start, state.end);
+  }
+
+  function renderEvents() {
+    grid.querySelectorAll('.event').forEach((eventCard) => eventCard.remove());
+    eventStates.forEach((state) => {
+      const eventCard = buildEventElement(state);
+      applyEventLayout(eventCard, state);
+      grid.insertBefore(eventCard, nowLine);
+    });
+    if (body.classList.contains('editable-active')) {
+      grid.querySelectorAll('.event-title').forEach((title) => {
+        title.contentEditable = 'true';
+      });
+    }
+  }
+
+  function saveState() {
+    const editable = editableNodes.map((node) => ({ id: node.dataset.editId, html: node.innerHTML }));
+    const events = eventStates.map((state) => ({
+      id: state.id,
+      titleHTML: state.titleHTML,
+      className: state.className,
+      left: state.left,
+      top: state.top,
+      width: state.width,
+      height: state.height,
+    }));
+    const selectedDay = document.querySelector('.dhead.selected, .dhead.is-selected')?.dataset.day || '14';
+    localStorage.setItem(storageKey, JSON.stringify({ editable, events, selectedDay }));
   }
 
   function setEditMode(enabled) {
@@ -315,6 +559,9 @@
     toolbar.setAttribute('aria-hidden', String(!enabled));
     editableNodes.forEach((node) => {
       node.contentEditable = enabled ? 'true' : 'false';
+    });
+    grid.querySelectorAll('.event-title').forEach((title) => {
+      title.contentEditable = enabled ? 'true' : 'false';
     });
   }
 
@@ -337,12 +584,11 @@
       dayNode.classList.toggle('selected', isMatch);
       dayNode.classList.toggle('is-selected', isMatch);
     });
-    const nowLine = document.querySelector('.now-line');
-    const activeHeader = document.querySelector(`.dhead[data-day="${day}"]`);
-    if (nowLine && activeHeader) {
-      const left = activeHeader.offsetLeft + 86;
-      nowLine.style.left = `${left + 0.6}px`;
+    const activeIndex = Math.max(0, Array.from(document.querySelectorAll('.dhead[data-day]')).findIndex((head) => head.dataset.day === day));
+    if (nowLine && initialDayLefts[activeIndex] !== undefined) {
+      nowLine.style.left = `${initialDayLefts[activeIndex].toFixed(1)}px`;
     }
+    saveState();
   }
 
   function shiftSelectedDay(direction) {
@@ -354,8 +600,93 @@
     if (next) updateSelectedDay(next.dataset.day);
   }
 
-  loadState();
+  function selectEvent(id) {
+    selectedEventId = id;
+    grid.querySelectorAll('.event').forEach((eventCard) => {
+      eventCard.classList.toggle('is-selected', eventCard.dataset.eventId === id);
+    });
+  }
+
+  function startEventInteraction(event, eventId) {
+    if (body.classList.contains('editable-active')) return;
+    if (event.button !== 0) return;
+    const eventCard = event.currentTarget;
+    const state = eventStates.find((entry) => entry.id === eventId);
+    if (!state) return;
+    selectEvent(eventId);
+    const resizing = !!event.target.closest('.event-resize-handle');
+    interaction = {
+      id: eventId,
+      mode: resizing ? 'resize' : 'drag',
+      startX: event.clientX,
+      startY: event.clientY,
+      startTop: state.top,
+      startHeight: state.height,
+      startLeft: state.left,
+    };
+    eventCard.classList.add('is-dragging');
+    eventCard.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function updateInteraction(clientX, clientY) {
+    if (!interaction) return;
+    const state = eventStates.find((entry) => entry.id === interaction.id);
+    if (!state) return;
+    const deltaY = clientY - interaction.startY;
+    const deltaX = clientX - interaction.startX;
+    if (interaction.mode === 'drag') {
+      state.top = clamp(snap(interaction.startTop + deltaY, snapHeight), 0, gridHeight - state.height);
+      state.left = nearestDayLeft(interaction.startLeft + deltaX);
+    } else {
+      state.height = clamp(snap(interaction.startHeight + deltaY, snapHeight), snapHeight, gridHeight - state.top);
+    }
+    const eventCard = grid.querySelector(`[data-event-id="${state.id}"]`);
+    if (eventCard) applyEventLayout(eventCard, state);
+  }
+
+  function finishInteraction(pointerId) {
+    if (!interaction) return;
+    const eventCard = grid.querySelector(`[data-event-id="${interaction.id}"]`);
+    if (eventCard) {
+      eventCard.classList.remove('is-dragging');
+      if (pointerId !== undefined && eventCard.hasPointerCapture(pointerId)) {
+        eventCard.releasePointerCapture(pointerId);
+      }
+    }
+    interaction = null;
+    saveState();
+  }
+
+  function createEventAt(clientX, clientY) {
+    const rect = grid.getBoundingClientRect();
+    const left = nearestDayLeft(clientX - rect.left);
+    const top = clamp(snap(clientY - rect.top, snapHeight), 0, gridHeight - snapHeight * 2);
+    const newState = makeEventState({
+      id: `event-${Date.now()}`,
+      titleHTML: 'New meeting',
+      className: 'event',
+      left,
+      top,
+      width: defaultEventWidth,
+      height: snapHeight * 4,
+    });
+    eventStates.push(newState);
+    renderEvents();
+    selectEvent(newState.id);
+    saveState();
+  }
+
+  const persistedState = getPersistedState();
+  applyEditableState(persistedState?.editable || []);
+  eventStates = (persistedState?.events?.length ? persistedState.events : collectInitialEventStates()).map((state) => makeEventState(state));
+  renderEvents();
   setEditMode(false);
+  updateSelectedDay(persistedState?.selectedDay || '14');
+
+  document.addEventListener('pointermove', (event) => updateInteraction(event.clientX, event.clientY));
+  document.addEventListener('pointerup', (event) => finishInteraction(event.pointerId));
+  document.addEventListener('pointercancel', (event) => finishInteraction(event.pointerId));
 
   document.addEventListener('keydown', (event) => {
     const isToggle = (event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'e';
@@ -367,12 +698,18 @@
     if (body.classList.contains('editable-active')) return;
     if (event.key === 'ArrowLeft') shiftSelectedDay(-1);
     if (event.key === 'ArrowRight') shiftSelectedDay(1);
+    if ((event.key === 'Backspace' || event.key === 'Delete') && selectedEventId) {
+      eventStates = eventStates.filter((state) => state.id !== selectedEventId);
+      selectedEventId = null;
+      renderEvents();
+      saveState();
+    }
   });
 
   editableNodes.forEach((node) => {
     node.addEventListener('blur', saveState);
     node.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && !event.shiftKey && node.closest('.event-title, .event-time, .task-text, .calendar-item span, .mini-head, .brand, .workspace, .period, .muted, .linkbtn, .allday')) {
+      if (event.key === 'Enter' && !event.shiftKey && node.closest('.task-text, .calendar-item span, .mini-head, .brand, .workspace, .period, .muted, .linkbtn, .allday')) {
         event.preventDefault();
         node.blur();
       }
@@ -393,14 +730,6 @@
     });
   });
 
-  document.querySelectorAll('.event').forEach((eventCard) => {
-    eventCard.addEventListener('click', () => {
-      if (body.classList.contains('editable-active')) return;
-      document.querySelectorAll('.event.is-selected').forEach((selected) => selected.classList.remove('is-selected'));
-      eventCard.classList.add('is-selected');
-    });
-  });
-
   document.querySelectorAll('.mini-day[data-day], .dhead[data-day]').forEach((node) => {
     node.addEventListener('click', () => {
       if (body.classList.contains('editable-active')) return;
@@ -410,6 +739,12 @@
 
   document.querySelectorAll('[data-nav="prev"], [data-nav="next"]').forEach((node) => {
     node.addEventListener('click', () => shiftSelectedDay(node.dataset.nav === 'prev' ? -1 : 1));
+  });
+
+  grid.addEventListener('dblclick', (event) => {
+    if (body.classList.contains('editable-active')) return;
+    if (event.target.closest('.event, .time-col, .scrollbar')) return;
+    createEventAt(event.clientX, event.clientY);
   });
 
   const todayButton = document.querySelector('.today');
@@ -424,6 +759,7 @@
     }
     if (action === 'reset') {
       localStorage.removeItem(storageKey);
+      localStorage.removeItem(legacyTextKey);
       window.location.reload();
     }
   });

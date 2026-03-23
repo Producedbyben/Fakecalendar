@@ -30,6 +30,14 @@
     color: var(--text);
   }
   body {
+    position: relative;
+  }
+  .stage {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    width: 3840px;
+    height: 2160px;
     display: grid;
     place-items: center;
     padding: 16px;
@@ -41,9 +49,8 @@
     grid-template-columns: 560px 1fr 72px 610px;
     grid-template-rows: 104px 1fr;
     background: #fff;
-    transform: scale(var(--app-scale, 1));
+    transform: translate(-50%, -50%) scale(var(--app-scale, 1));
     transform-origin: center center;
-    box-shadow: 0 18px 48px rgba(60,64,67,.24);
   }
   .topbar {
     grid-column: 1 / -1;
@@ -352,15 +359,10 @@
   let interaction = null;
 
   function updateStageScale() {
-    const widthPadding = 48;
-    const heightPadding = 48;
-    const availableWidth = Math.max(320, window.innerWidth - widthPadding);
-    const availableHeight = Math.max(320, window.innerHeight - heightPadding);
-    const scale = Math.min(availableWidth / 3840, availableHeight / 2160);
-    document.documentElement.style.setProperty('--app-scale', String(Math.min(1, scale)));
-    if (stage) {
-      stage.style.margin = '0';
-    }
+    const availableWidth = Math.max(320, window.innerWidth);
+    const availableHeight = Math.max(320, window.innerHeight);
+    const scale = Math.max(availableWidth / 3840, availableHeight / 2160);
+    document.documentElement.style.setProperty('--app-scale', String(scale));
   }
 
   editableNodes.forEach((node, index) => {

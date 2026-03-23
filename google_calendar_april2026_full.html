@@ -34,23 +34,16 @@
   }
   .stage {
     position: fixed;
-    top: 50%;
-    left: 50%;
-    width: 3840px;
-    height: 2160px;
-    display: grid;
-    place-items: center;
-    padding: 16px;
-  }
-  .stage {
+    top: 0;
+    left: 0;
     width: 3840px;
     height: 2160px;
     display: grid;
     grid-template-columns: 560px 1fr 72px 610px;
     grid-template-rows: 104px 1fr;
     background: #fff;
-    transform: translate(-50%, -50%) scale(var(--app-scale, 1));
-    transform-origin: center center;
+    transform: translate(var(--app-offset-x, 0px), var(--app-offset-y, 0px)) scale(var(--app-scale, 1));
+    transform-origin: top left;
   }
   .topbar {
     grid-column: 1 / -1;
@@ -361,8 +354,12 @@
   function updateStageScale() {
     const availableWidth = Math.max(320, window.innerWidth);
     const availableHeight = Math.max(320, window.innerHeight);
-    const scale = Math.max(availableWidth / 3840, availableHeight / 2160);
+    const scale = Math.min(availableWidth / 3840, availableHeight / 2160);
+    const offsetX = Math.max(0, (availableWidth - 3840 * scale) / 2);
+    const offsetY = Math.max(0, (availableHeight - 2160 * scale) / 2);
     document.documentElement.style.setProperty('--app-scale', String(scale));
+    document.documentElement.style.setProperty('--app-offset-x', `${offsetX}px`);
+    document.documentElement.style.setProperty('--app-offset-y', `${offsetY}px`);
   }
 
   editableNodes.forEach((node, index) => {
